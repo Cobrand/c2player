@@ -1,0 +1,15 @@
+[package]
+name = "c2player"
+version = "0.1.0"
+authors = ["Cobrand <cobrandw@gmail.com>"]
+
+[dependencies]
+libavformat = {path = "libavformat/"}
+ioctl = "^0.3"
+libc = "^0.2"
+error-chain = "^0.9"
+x11-dl = "^2"
+
+[lib]
+name = "c2player"
+crate-type = ["dylib"]
