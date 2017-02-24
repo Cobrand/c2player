@@ -1,43 +1,49 @@
 use error::*;
-use super::x11helper::{self, XDisplay};
-use super::video::VideoEndReason;
+use super::x11helper::X11Helper;
+use super::libavhelper::{main_thread as libav_main_thread, Message as LibavMessage, PacketWrapper as LibavPacket};
+use super::amcodec::{self, main_loop as amcodec_main_loop, Message as AmcodecMessage, EndReason as VideoEndReason};
+use super::utils::SingleUseSender as SuSender;
 
-use std::fs::File;
-use std::sync::{Arc, Mutex, atomic};
-use std::{ptr, mem, thread};
+use std::sync::{Arc, atomic};
+use std::{ptr, thread};
 use std::sync::mpsc::{self, Receiver, Sender};
-use x11_dl::xlib;
-use libc::{c_int, c_long, c_ulong, c_void, c_char};
-use std::ffi::CString;
+use libc::c_int;
 use std::thread::JoinHandle;
+use libavformat;
+use super::libavhelper::avformat_version;
 
 pub struct FfiPlayer {
-    main_thread: JoinHandle<()>,
-    x11_event_loop_thread: JoinHandle<()>,
-    video_status_queue: Receiver<VideoEndReason>,
-    sender: Sender<Message>,
-    keep_running: Arc<atomic::AtomicBool>,
+    pub main_thread: JoinHandle<()>,
+    pub x11_event_loop_thread: JoinHandle<()>,
+    pub amcodec_thread: JoinHandle<()>,
+    pub libav_getter_thread: JoinHandle<()>,
+    pub video_status_queue: Receiver<VideoEndReason>,
+    pub sender: Sender<Message>,
+    pub keep_running: Arc<atomic::AtomicBool>,
 }
 
 impl FfiPlayer {
-    pub fn new(main_thread: JoinHandle<()>, x11_thread: JoinHandle<()>, video_rx: Receiver<VideoEndReason>, sender: Sender<Message>, keep_running: Arc<atomic::AtomicBool>) -> FfiPlayer {
-        FfiPlayer {
-            main_thread: main_thread,
-            x11_event_loop_thread: x11_thread,
-            video_status_queue: video_rx,
-            sender: sender,
-            keep_running: keep_running,
-        }
-    }
-
-    pub fn join(self) {
+    pub fn join(self) -> FfiResult {
+        let mut error_code = Ok(());
         if let Err(_) = self.main_thread.join() {
+            error_code = Err(FfiErrorCode::ShutdownError);
             println!("Main Thread panicked");
         };
         if let Err(_) = self.x11_event_loop_thread.join() {
+            error_code = Err(FfiErrorCode::ShutdownError);
             println!("X11 Event Thread panicked");
         };
+        if let Err(_) = self.amcodec_thread.join() {
+            error_code = Err(FfiErrorCode::ShutdownError);
+            println!("Amcodec Thread panicked");
+        };
+        if let Err(_) = self.libav_getter_thread.join() {
+            error_code = Err(FfiErrorCode::ShutdownError);
+            println!("Libav Thread panicked");
+        };
+        error_code
     }
+
 
     pub fn send_message(&self, message: Message) -> bool {
         match self.sender.send(message) {
@@ -51,7 +57,10 @@ impl FfiPlayer {
 
     pub fn wait_for_video_status(&mut self) -> c_int {
         match self.video_status_queue.recv() {
-            Ok(VideoEndReason::Error) => 1,
+            Ok(VideoEndReason::Error(s)) => {
+                println!("A fatal error happened when decoding a video packet: {}", s);
+                1
+            },
             Ok(VideoEndReason::EOF) => 0,
             Err(e) => {
                 println!("Video status channel disconnected : {}", e);
@@ -61,224 +70,169 @@ impl FfiPlayer {
     }
 }
 
-#[derive(Debug)]
 pub enum Message {
-    SetSize(u16, u16),
-    SetPos(i16, i16),
-    SetFullscreen(bool),
+    SetSize(SuSender<FfiErrorCode>, (u16, u16)),
+    SetPos(SuSender<FfiErrorCode>,(i16, i16)),
+    SetFullscreen(SuSender<FfiErrorCode>, bool),
+    Show(SuSender<FfiErrorCode>),
+    Hide(SuSender<FfiErrorCode>),
+    Play(SuSender<FfiErrorCode>),
+    Pause(SuSender<FfiErrorCode>),
+    Load(SuSender<FfiErrorCode>, String),
+    Seek(SuSender<FfiErrorCode>, f64),
     Shutdown
 }
 
-// pub struct Player {
-//     // X11 properties
-//     pub xlib: Arc<xlib::Xlib>,
-//     pub screen: c_int,
-//     pub display: Arc<x11helper::XDisplay>,
-//     pub window: c_ulong,
-
-//     #[cfg(target_arch = "aarch64")]
-//     // amlogic
-//     pub amstream_vbuf: File,
-// }
-
-fn x11_init_event_loop_thread(xlib: &Arc<xlib::Xlib>, display: &Arc<XDisplay>, window: c_ulong, keep_running: Arc<atomic::AtomicBool>) -> JoinHandle<()> {
-    let display = display.clone();
-    let xlib = xlib.clone();
-    thread::spawn(move || {
-        x11helper::event_loop(xlib, display, window, keep_running);
-    })
-}
-
 pub fn player_start() -> Result<FfiPlayer> {
-    let xlib = xlib::Xlib::open()?;
-    let xlib = Arc::new(xlib);
-    
-    // Open display connection.
-    let display = Arc::new(x11helper::XDisplay::new(xlib.clone(), ptr::null())?);
+    let (version_major, version_minor) = avformat_version();
+    // we are only checking the major version here, because breaking changes
+    // only happen between major versions, hence even though the minor version changes,
+    // we are still "safe" from unexpected behavior
+    if version_major != libavformat::LIBAVCODEC_VERSION_MAJOR as u16 {
+        println!("Linked avformat version differs from the one the header was built with.\
+                This can lead to unexpected behavior and segfaults at times.\
+                Aborting");
+        bail!(ErrorKind::WrongLibavVersion);
+    } else {
+        println!("using libavformat version {}.{}", version_major, version_minor);
+    };
 
-    // Create window.
-    let screen = unsafe { (xlib.XDefaultScreen)(display.as_ptr()) };
-    let root = unsafe {(xlib.XRootWindow)(display.as_ptr(), screen)};
-    
-    let window = x11helper::create_window(&xlib, display.as_ptr(), root);
-
-    x11helper::set_window_borderless(&xlib, display.as_ptr(), window);
-
-    // Set window title.
-    let title_str = CString::new("hello-world").unwrap();
-    unsafe {
-        (xlib.XStoreName)(display.as_ptr(), window, title_str.as_ptr() as *mut c_char);
-    }
+    let x11_helper = Arc::new(X11Helper::new(ptr::null_mut())?);
+    if let Err(e) = x11_helper.set_borderless(true) {
+        println!("failed to set x11 window borderless: {}", e.display());
+    };
 
     let (sender, receiver) = mpsc::channel::<Message>();
     let (video_status_sender, video_status_rx) = mpsc::channel::<VideoEndReason>();
-    let x11_sender = sender.clone();
     let keep_running = Arc::new(atomic::AtomicBool::new(true));
-    let x11_thread = x11_init_event_loop_thread(&xlib, &display, window, keep_running.clone());
-
-    let main_thread = {
+    
+    let x11_thread = {
+        let x11_helper = x11_helper.clone();
         let keep_running = keep_running.clone();
         thread::spawn(move || {
-            'mainloop: for message in receiver.iter() {
-                println!("Main thread: received message {:?}", message);
-                match message {
-                    Message::Shutdown => {break 'mainloop},
-                     => {}
-                };
-            };
-            keep_running.store(false, atomic::Ordering::SeqCst);
-            println!("Finishing main loop ...");
+            x11_helper.event_loop(keep_running);
         })
     };
 
-    Ok(FfiPlayer::new(main_thread, x11_thread, video_status_rx, sender, keep_running))
+    let (packet_sender, packet_receiver) = mpsc::channel::<LibavPacket>();
+    let (libav_sender, libav_receiver) = mpsc::channel::<(LibavMessage, SuSender<FfiErrorCode>)>();
+    let (amcodec_sender, amcodec_receiver) = mpsc::channel::<(AmcodecMessage, SuSender<FfiErrorCode>)>();
+
+    let libav_thread = {
+        let keep_running = keep_running.clone();
+        thread::spawn(move || {
+            libav_main_thread(libav_receiver, packet_sender, keep_running);
+        })
+    };
+
+    let amcodec_thread = {
+        let keep_running = keep_running.clone();
+        // _fb_wrapper is not used but is the thing that allow us to have a transparent framebuffer
+        // as long as it lives we can set some alpha of the framebuffer to 0
+        let _fb_wrapper = amcodec::FbWrapper::new()?;
+        let amcodec = amcodec::Amcodec::new(video_status_sender.clone())?;
+        let version = amcodec.version()?;
+        println!("amcodec_thread: AMSTREAM version {}.{}", version.0, version.1);
+        thread::spawn(move || {
+            // move fb_wrapper inside the thread so that it is only destroyed after the thread is
+            // complete
+            let _fb_wrapper = _fb_wrapper;
+            amcodec_main_loop(amcodec, amcodec_receiver, packet_receiver, video_status_sender, keep_running);
+        })
+    };
+
+    let main_thread = {
+        let (mut window_x, mut window_y, mut window_w, mut window_h) = (0i16, 0i16, 1920u16, 1080u16);
+        let keep_running = keep_running.clone();
+        thread::spawn(move || {
+            let libav_channel = libav_sender;
+            let amcodec_channel = amcodec_sender;
+            'mainloop: for message in receiver.iter() {
+                match message {
+                    Message::Shutdown => {
+                        break 'mainloop;
+                    },
+                    Message::SetFullscreen(tx, b) => {
+                        if b == true {
+                            if let Err(_) = amcodec_channel.send((AmcodecMessage::Fullscreen, tx.clone())) {
+                                println!("main_thread: amcodec_channel disconnected, aborting");
+                                tx.send(FfiErrorCode::Disconnected);
+                                break 'mainloop;
+                            }
+                        };
+                        if let Err(e) = x11_helper.set_fullscreen(b) {
+                            println!("main_thread: failed to set x11 window fullscreen: {}", e.display());
+                        };
+                    },
+                    Message::Show(tx) => {
+                        x11_helper.show();
+                        tx.send(FfiErrorCode::None);
+                    },
+                    Message::Hide(tx) => {
+                        x11_helper.hide();
+                        tx.send(FfiErrorCode::None);
+                    },
+                    Message::SetPos(tx,(x, y)) => {
+                        window_x = x;
+                        window_y = y;
+                        if let Err(_) = amcodec_channel.send((AmcodecMessage::Resize(window_x, window_y, window_w, window_h), tx.clone())) {
+                            println!("main_thread: amcodec_channel disconnected, aborting");
+                            tx.send(FfiErrorCode::Disconnected);
+                            break 'mainloop;
+                        }
+                        x11_helper.set_pos(x, y);
+                    },
+                    Message::SetSize(tx,(w, h)) => {
+                        window_w = w;
+                        window_h = h;
+                        if let Err(_) = amcodec_channel.send((AmcodecMessage::Resize(window_x, window_y, window_w, window_h), tx.clone())) {
+                            println!("main_thread: amcodec_channel disconnected, aborting");
+                            tx.send(FfiErrorCode::Disconnected);
+                            break 'mainloop;
+                        }
+                        x11_helper.set_size(w, h);
+                        tx.send(FfiErrorCode::None);
+                    },
+                    Message::Load(tx,url) => {
+                        if let Err(_) = libav_channel.send((LibavMessage::Load(url), tx.clone())) {
+                            tx.send(FfiErrorCode::LibAvDisconnected);
+                        };
+                    },
+                    Message::Seek(tx, pos) => {
+                        if let Err(_) = libav_channel.send((LibavMessage::Seek(pos), tx.clone())) {
+                            tx.send(FfiErrorCode::LibAvDisconnected);
+                        };
+                    },
+                    Message::Play(tx) => {
+                        if let Err(_) = amcodec_channel.send((AmcodecMessage::Play, tx.clone())) {
+                            println!("main_thread: amcodec_channel disconnected, aborting");
+                            tx.send(FfiErrorCode::Disconnected);
+                            break 'mainloop;
+                        };
+                    },
+                    Message::Pause(tx) => {
+                        if let Err(_) = amcodec_channel.send((AmcodecMessage::Pause, tx.clone())) {
+                            println!("main_thread: amcodec_channel disconnected, aborting");
+                            tx.send(FfiErrorCode::Disconnected);
+                            break 'mainloop;
+                        };
+                    }
+                };
+            };
+            keep_running.store(false, atomic::Ordering::SeqCst);
+            if cfg!(debug_assertions) {
+                println!("Finishing main loop ...");
+            }
+        })
+    };
+
+    Ok(FfiPlayer {
+        main_thread: main_thread,
+        x11_event_loop_thread: x11_thread,
+        amcodec_thread: amcodec_thread,
+        libav_getter_thread: libav_thread,
+        video_status_queue: video_status_rx,
+        sender: sender,
+        keep_running: keep_running,
+    })
 }
-
-// impl Player {
-//     pub fn new() -> Result<Player> {
-//         let xlib = xlib::Xlib::open()?;
-//         let xlib = Arc::new(xlib);
-        
-//         // Open display connection.
-//         let display = Arc::new(x11helper::XDisplay::new(xlib.clone(), ptr::null())?);
-
-//         // Create window.
-//         let screen = unsafe { (xlib.XDefaultScreen)(display.as_ptr()) };
-//         let root = unsafe {(xlib.XRootWindow)(display.as_ptr(), screen)};
-        
-//         let window = x11helper::create_window(&xlib, display.as_ptr(), root);
-
-//         x11helper::set_window_borderless(&xlib, display.as_ptr(), window);
-
-//         // Set window title.
-//         let title_str = CString::new("hello-world").unwrap();
-//         unsafe {
-//             (xlib.XStoreName)(display.as_ptr(), window, title_str.as_ptr() as *mut c_char);
-//         }
-
-//         // // Hook close requests.
-//         // let wm_protocols_str = CString::new("WM_PROTOCOLS").unwrap();
-//         // let wm_delete_window_str = CString::new("WM_DELETE_WINDOW").unwrap();
-
-//         // let wm_protocols = unsafe {(xlib.XInternAtom)(display.as_ptr(), wm_protocols_str.as_ptr(), xlib::False)};
-//         // let wm_delete_window = unsafe {(xlib.XInternAtom)(display.as_ptr(), wm_delete_window_str.as_ptr(), xlib::False)};
-
-//         // let mut protocols = [wm_delete_window];
-
-//         // unsafe {
-//         //     (xlib.XSetWMProtocols)(display.as_ptr(), window, protocols.as_mut_ptr(), protocols.len() as c_int);
-
-//         //     // Show window.
-//         //     (xlib.XMapWindow)(display.as_ptr(), window);
-//         // }
-        
-//         // x11helper::set_window_fullscreen(&xlib, display.as_ptr(), root, window, true);
-        
-//         // {
-//         //     // cast to usize is required because ptrs cannot be sent between threads
-//         //     // in normal circumstances.
-//         //     // This OP is basically unsafe
-//         //     let display = display.clone();
-//         //     let xlib = xlib.clone();
-//         //     thread::spawn(move || {
-//         //         // since this will be modified by XNextEvent, we dont care if its
-//         //         // initialized or not
-//         //         let mut event: xlib::XEvent = unsafe {mem::uninitialized()};
-
-//         //         loop {
-//         //             unsafe {
-//         //                 (xlib.XNextEvent)(display.as_ptr(), &mut event);
-//         //             }
-
-//         //             println!("{} : {:?}", event.get_type(), event.pad);
-//         //             // {
-//         //             //     xlib::ClientMessage => {
-//         //             //         let xclient = xlib::XClientMessageEvent::from(event);
-
-//         //             //         if xclient.message_type == wm_protocols && xclient.format == 32 {
-//         //             //             let protocol = xclient.data.get_long(0) as xlib::Atom;
-
-//         //             //             if protocol == wm_delete_window {
-//         //             //                 break;
-//         //             //             }
-//         //             //         }
-//         //             //     },
-//         //             //     _ => ()
-//         //             // }
-//         //         }
-//         //     });
-//         // }
-
-//         #[cfg(target_arch = "aarch64")]
-//         {
-//             let amstream_vbuf = File::open("/dev/amstream_vbuf")
-//                 .chain_err(|| "Unable to open /dev/amstream_vbuf")?;
-//             Ok(Player {
-//                 xlib: xlib,
-//                 screen: screen,
-//                 display: display,
-//                 window: window,
-//                 amstream_vbuf: amstream_vbuf,
-//             })
-//         }
-
-//         #[cfg(not(target_arch = "aarch64"))]
-//         {
-//             Ok(Player {
-//                 xlib: xlib,
-//                 screen: screen,
-//                 display: display,
-//                 window: window,
-//             })
-//         }
-//     }
-
-//     pub fn run(self) -> mpsc::Sender<C2Message> {
-//         let (sender, receiver) = mpsc::channel::<C2Message>();
-//         let x11_sender = sender.clone();
-//         self.x11_init_event_loop_thread(x11_sender);
-
-//         let player = self;
-//         println!("About to spawn main thread");
-//         thread::spawn(move || {
-//             use std::io::{self, Write};
-//             println!("Spawned Main thread");
-//             let stdout = io::stdout();
-//             'mainloop: for message in receiver.iter() {
-//                 let mut handle = stdout.lock();
-//                 writeln!(&mut handle, "Main thread: received message {:?}", message);
-//                 match message {
-//                     C2Message::Shutdown => {break 'mainloop},
-//                     _ => {}
-//                 };
-//             };
-//             let mut handle = stdout.lock();
-//             writeln!(&mut handle, "Main thread: shutting down");
-//             println!("Main thread: shutting down");
-//             unsafe {
-//                 (player.xlib.XDestroyWindow)(player.display.as_ptr(), player.window);
-//             }
-//         });
-//         sender
-//     }
-
-//     pub fn x11_init_event_loop_thread(&self, sender: mpsc::Sender<C2Message>) {
-//         let display = self.display.clone();
-//         let xlib = self.xlib.clone();
-//         let window = self.window.clone();
-//         thread::spawn(move || {
-//             x11helper::event_loop(xlib, display, window, sender);
-//         });
-//     }
-// }
-
-// // impl ::std::ops::Drop for Player {
-// //     fn drop(&mut self) {
-// //         unsafe {
-// //             (self.xlib.XDestroyWindow)(self.display.as_ptr(), self.window);
-
-// //             // Shut down.
-// //             // (self.xlib.XCloseDisplay)(self.display.as_ptr());
-// //         }
-// //     }
-// // }
