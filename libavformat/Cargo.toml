@@ -8,3 +8,7 @@ build = "build.rs"
 
 [build-dependencies]
 bindgen = "0.20"
+
+[features]
+default = []
+generate_avformat_rs = []
