@@ -1,3 +1,8 @@
+/// A very simple wrapper over the mpsc API, which allows us to only receive and send one Message
+/// over the channel
+// It has a very limited use, and we could have done without it with retrospective, but I don't
+// think it's that bad either.
+
 use std::sync::mpsc::{self, SyncSender, Receiver};
 
 pub fn single_use_channel<T>() -> (SingleUseSender<T>, SingleUseReceiver<T>) {

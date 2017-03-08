@@ -11,6 +11,7 @@ use std::os::raw::c_int;
 use super::utils::SingleUseSender as SuSender;
 use libavformat as libav;
 
+// helper function which reduces the code by a few lines
 macro_rules! handle_channel_error {
     ( $x: expr, $tx: expr) => {
         if let Err(e) = $x {
@@ -27,8 +28,13 @@ macro_rules! handle_channel_error {
     };
 }
 
+// "EOF" error from libav
 const EOF : i32 = -1 * (((b'E' as u32) | (('O' as u32) << 8) | (('F' as u32) << 16) | ((' ' as u32) << 24)) as i32);
 
+/// libav context
+///
+/// We only need the context itself and which index the hevc_stream is at. Everything else can be
+/// retrieved directly from the context itself
 struct Context {
     pub ctx: *mut libav::AVFormatContext,
     pub hevc_stream: usize,
@@ -43,6 +49,10 @@ pub fn avformat_version() -> (u16, u16) {
     }
 }
 
+/// the context will be able to open both file on the filesysttem and urls (because
+/// avformat_open_input allows us to do this)
+///
+/// It fails if the input is incorrect of if the video does not have an HEVC stream
 impl Context {
     pub fn new<S: AsRef<str>>(url: S) -> Result<Context> {
         let mut ctx : *mut libav::AVFormatContext = ptr::null_mut();
@@ -71,6 +81,7 @@ impl Context {
         }
     }
 
+    /// Seeks the context at a position starting from the beginning of the file
     pub fn seek(&mut self, pos: f64) -> Result<()> {
         let r = unsafe {
             libav::av_seek_frame(self.ctx, -1, (pos * (libav::AV_TIME_BASE as f64)) as i64, libav::AVFMT_SEEK_TO_PTS as c_int)
@@ -81,7 +92,13 @@ impl Context {
         Ok(())
     }
 
+    /// Will try to get extra_data
+    ///
+    /// It looks like sometimes there is no extra_data associated, but I have yet to find a file in
+    /// HEVC with no extra_data in it
     pub fn get_extra_data(&self) -> Result<Arc<Vec<u8>>> {
+        // this code is shamelessly inspired from OtherCrashOverride/c2play
+        // it works for now, so only change it if it doesn't anymore
         unsafe {
             let stream : *mut _ = *(*self.ctx).streams.offset(self.hevc_stream as isize);
             let codec : *mut _ = (*stream).codec;
@@ -114,11 +131,17 @@ impl Context {
                     }
                 }
             }
-            println!("amcodec: extra_data size: {}", (*codec).extradata_size);
+            // we will need to send extra_data across a thread, but we don't have the guarentee
+            // that this will live long enough to the extra_data to be still alive, so we just copy
+            // it to a Vec and sahre it across threads
             Ok(Arc::new(extra_data))
         }
     }
 
+    /// returns Some(i) where i is the index of the HEVC stream,
+    /// None if the HEVC has been found
+    ///
+    /// THis typically means the end of the playback
     fn retrieve_hevc_stream(ctx: *mut libav::AVFormatContext) -> Option<usize> {
         unsafe {
             let ret = libav::avformat_find_stream_info(ctx, ptr::null_mut());
@@ -146,11 +169,18 @@ impl Context {
         None
     }
     
+    /// Tries to get the next frame from the context
+    ///
+    /// The fundamental call behind this is "av_read_frame" which is a blocking call. On a
+    /// filesystem it will never block for too long, but over slow networks it might be very slow,
+    /// so beware.
     pub fn next_frame(&mut self) -> Result<Packet> {
         unsafe {
             let mut packet : libav::AVPacket = mem::uninitialized();
             let ret = libav::av_read_frame(self.ctx as *mut _, &mut packet as *mut _);
             match ret {
+                // if we get the EOF constant (defined as a cosnt up there),
+                // return a custom EOF error
                 EOF => bail!(ErrorKind::EOF),
                 _ if ret >= 0 => {
                     Ok(Packet {
@@ -174,6 +204,13 @@ impl Drop for Context {
     }
 }
 
+/// Only two types of messages can be sent from the main thread:
+///
+/// * Load a new file
+/// * Go to position X in the current file
+///
+/// Every other order is actually processed either in the main thread of in the video decoding
+/// thread
 #[derive(Debug)]
 pub enum Message {
     Load(String),
@@ -194,7 +231,7 @@ pub enum PacketWrapper {
     /// A message describing that the file's done playing,
     /// after this point it should wait for other ExtraData
     EOF,
-    /// Send an error to amcodec thread
+    /// Send an error to amcodec thread (unused for now)
     Error(Error),
     /// Stop the current playback (to load something else instead for
     /// example)
@@ -204,6 +241,9 @@ pub enum PacketWrapper {
 impl Drop for Packet {
     fn drop(&mut self) {
         unsafe {
+            // we don't own the packet, so calling "free" is not appropriate, however libavformat
+            // knows we still have a reference of this packet, so calling this allows it to know
+            // that we don't need this packet anymore
             libav::av_packet_unref(&mut self.inner as *mut _);
         }
     }
@@ -211,6 +251,11 @@ impl Drop for Packet {
 
 unsafe impl Send for Packet {}
 
+/// the main thread which will do the libav work
+///
+/// rx: Receiver which receives commands and responds to them via a SingleUsageSender<FfiErrorCode>
+/// packet_channel: the channel where the thread must send its packets
+/// keep_running: once in a while check this variable to make sure the program isn't aborting
 pub fn main_thread(rx: Receiver<(Message, SuSender<FfiErrorCode>)>, packet_channel: Sender<PacketWrapper>, keep_running: Arc<AtomicBool>) {
     println!("libavthread starting");
     let mut allow_next_frame = true;
@@ -221,11 +266,19 @@ pub fn main_thread(rx: Receiver<(Message, SuSender<FfiErrorCode>)>, packet_chann
         libav::av_register_all();
         // Initialize network
         libav::avformat_network_init();
+        // this is an option because there can be a very wide margin of time where no video is
+        // loaded (remember that load(..) is seperate from create(..) in the API.
+        // Plus if there is an invalid file opened, we must have a way to know that no file is
+        // playing at the moment
         let mut context : Option<Context> = None;
         while keep_running.load(Ordering::SeqCst) == true {
             match rx.try_recv() {
                 Ok((Message::Load(m), tx)) => {
                     handle_channel_error!(packet_channel.send(PacketWrapper::Stop), tx);
+                    // allow_next_frame is a weird name to stop trying to get the next_frame after
+                    // EOF or an error. Another solution would be to set the Context to None, but
+                    // then we wouldn't be able to Seek at the beginning after a EndOfFile without
+                    // reloading the whole file again
                     allow_next_frame = true;
                     context = match Context::new(m.as_str()) {
                         Ok(context) => {
@@ -248,6 +301,11 @@ pub fn main_thread(rx: Receiver<(Message, SuSender<FfiErrorCode>)>, packet_chann
                         }
                     };
                 },
+                // Seek is actually done by stopping totally the decoding in amcodec, and then
+                // loading the same video in Amcodec, and sending directly the packet from the
+                // seeked position. There are ways to directly seek withotu changing amcodec or
+                // this context, but it can lead to visual artifcats or weird behavior, so better
+                // be safe than sorry with discarding the video in the amcodec thread first
                 Ok((Message::Seek(pos), tx)) => {
                     if let Some(ref mut context) = context {
                         handle_channel_error!(packet_channel.send(PacketWrapper::Stop), tx);
@@ -299,6 +357,8 @@ pub fn main_thread(rx: Receiver<(Message, SuSender<FfiErrorCode>)>, packet_chann
                     };
                 };
             };
+            // a very small sleep time still allows us to not "actively" sleep and ease the CPU's
+            // load
             thread::sleep(Duration::from_millis(5));
         }
     }

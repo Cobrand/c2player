@@ -16,6 +16,11 @@ use super::amcodec_sys::*;
 
 use super::libavhelper::PacketWrapper as LibavPacket;
 
+// This state will allow us to have a pseudo-state machine
+// It is not exactly a state machine, but it still has some very strict rules about the states it
+// can change to
+//
+// If this were really a state machine, the commands would be "play", "pause", "finish" and "stop".
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum State {
     /// A video has not yet / is being buffered
@@ -30,6 +35,14 @@ enum State {
     /// The video is finished being buffered (EOF received)
     /// but the VPU is still non-empty, so we need
     /// to finish the playback until the VPU is empty
+    ///
+    /// The very simple actual way to get if a file is finished is:
+    /// * we got EOF before (which happened cause we are in this State)
+    /// * we don't have enough data in the VPU to get another frame, hence we are stuck
+    ///
+    /// If we are stuck too many times, we can just assume that there is nothing left to play
+    /// and the file is actually finished. same_data_len_count actually coutns how many times the
+    /// "data_len" variable has been the same.
     Finishing {
         prev_data_len: c_int,
         same_data_len_count: u32,
@@ -48,7 +61,8 @@ enum State {
     Stopped(bool),
 }
 
-
+// All the cfg(not(target_arch = "aarch64")) are dummies so that
+// it can compile for x86_64 architectures.
 #[cfg(not(target_arch = "aarch64"))]
 pub struct FbWrapper;
 
@@ -72,6 +86,9 @@ pub struct Amcodec {
     pub status_sender: Sender<EndReason>,
 }
 
+/// This structure holds the info of the framebuffer before it went transparent:
+/// we must enable the alpha byte on the framebuffer for the video to play, but the best would be
+/// to restore previous settings
 #[cfg(target_arch = "aarch64")]
 impl FbWrapper {
     pub fn new() -> Result<FbWrapper> {
@@ -119,6 +136,8 @@ pub struct Amcodec {
     sender: Sender<EndReason>,
 }
 
+/// A dummy for x86_64 and other architectures. Doesn't play a video, but "simulates" one for tests
+/// and other stuff.
 #[cfg(not(target_arch = "aarch64"))]
 impl Amcodec {
     pub fn new(status_sender: Sender<EndReason>) -> Result<Amcodec> {
@@ -153,6 +172,8 @@ impl Amcodec {
         self.state = State::Paused;
     }
 }
+
+/// dummy version of the main loop
 #[cfg(not(target_arch = "aarch64"))]
 pub fn main_loop(mut amcodec: Amcodec,
                    rx: Receiver<(Message, SuSender<FfiErrorCode>)>,
@@ -186,6 +207,14 @@ pub fn main_loop(mut amcodec: Amcodec,
     println!("amcodec_thread: shutting down ...");
 }
 
+/// the main loop for the amcodec thread
+///
+/// * amcodec: Amcodec is created before this thread is spawned because it allows easier
+/// error-reporting (such as the driver does not exist)
+/// * rx: various messages such as Play, Pause, Resize, ... are sent to this channel
+/// this channel also includes a way to answers those requests via a SingleUsageChannel
+/// * status_sender: allows us to notify the API's user when an EOF has happened
+/// * keep_running: if this becomes false then this thread must abort as soon as possible
 #[cfg(target_arch = "aarch64")]
 impl Amcodec {
     /// sometimes opening the file won't work right away,
@@ -206,6 +235,8 @@ impl Amcodec {
         }
     }
 
+    /// This Amcodec creationis kind of cheating: we already know in advance that we only support
+    /// HEVC, hence we can make it so HEVC is always enabled. 
     pub fn new(status_sender: Sender<EndReason>) -> Result<Amcodec> {
         let hevc_device = Self::try_open(OpenOptions::new().write(true).read(false), "/dev/amstream_hevc", 100)
             .chain_err(|| ErrorKind::Amcodec)?;
@@ -221,7 +252,7 @@ impl Amcodec {
             if r < 0 {
                 bail!(ErrorKind::Ioctl("amstream_ioc_set"));
             }
-            // see amstream_ioc_sysinfo declaration for why we need to cast to a c_int
+            // see amstream_ioc_sysinfo declaration in amcodec_sys for why we need to cast to a c_int
             let r = amstream_ioc_sysinfo(hevc_device.as_raw_fd(), &am_sysinfo as *const _ as *const c_int);
             if r < 0 {
                 bail!(ErrorKind::Ioctl("amstream_ioc_sysinfo"));
@@ -338,6 +369,7 @@ impl Amcodec {
             State::Stopped(b) => {
                 self.clear_video()?;
                 if b {
+                    // this will unblock "wait_until_end" calls from the API
                     self.status_sender.send(EndReason::EOF)
                         .chain_err(|| ErrorKind::Disconnected)?;
                 } 
@@ -357,6 +389,8 @@ impl Amcodec {
         Ok(())
     }
 
+    // we talked about a pseudo state machine up there, this is the method that allows it
+    // to update itself
     pub fn update_state(&mut self) -> Result<bool> {
         let new_state : State = match &self.state {
             &State::Finishing {
@@ -391,6 +425,10 @@ impl Amcodec {
         }
     }
 
+    // write some bytes in the hevc_device driver file
+    //
+    // this can sometimes fail with an "unavailable" error, sometimes within the middle of a
+    // playback even, but this doesn't stop us from playing the video at all
     fn write_codec(&mut self, data: &[u8]) -> Result<()> {
         use std::io::Write;
         // calls `write` until the whole buffer has been written in the file
@@ -400,10 +438,15 @@ impl Amcodec {
         Ok(())
     }
 
+    // writing extra_data is actually writing data to the codec ... the only thing is that it must
+    // be done before any other data
+    #[inline]
     fn write_extra_data(&mut self, extra_data: &[u8]) -> Result<()> {
         self.write_codec(extra_data)
     }
 
+    // clears the buffer output (on the screen), but it doesn't look like it clears the VPU's inner
+    // memory
     fn clear_video(&mut self) -> Result<()> {
         let v : c_int = 1;
         let r = unsafe {
@@ -415,7 +458,8 @@ impl Amcodec {
         Ok(())
     }
 
-    /// unused when operating on video only
+    // unused when operating on video only
+    // this was implemented when trying to get the driver working, but is unused now
     #[allow(unused)]
     fn set_tstamp(&mut self, pts: u32) -> Result<()> {
         let mut parm : am_ioctl_parm = unsafe { mem::zeroed() };
@@ -432,6 +476,8 @@ impl Amcodec {
         Ok(())
     }
 
+    // this s ia key step for the video processing of the VPU, if we don't do this step the VPU
+    // only outputs pitch black
     fn process_nal_packets(data: &mut [u8]) -> Result<()> {
         let mut offset : usize = 0;
         while offset < data.len() {
@@ -520,6 +566,9 @@ impl Drop for FbWrapper {
 #[derive(Debug)]
 pub enum EndReason {
     EOF,
+    // the EndReason "Error" is unused for now, but we might find a use later:
+    // I haven't found yet an error that was so fatal in the middle of the playback that it stopped
+    // the playback totally
     #[allow(unused)]
     Error(String),
 }
@@ -593,17 +642,25 @@ pub fn main_loop(mut amcodec: Amcodec,
                 };
             },
             Err(TryRecvError::Disconnected) => {
-                // it's pointless to keep going if the X11 window has been destroyed ...
-                break;
+                // the packet channel is disconnected, but it doesn't mean we should stop palyback
+                // yet. Maybe the other thread crashed or something, but we can still keep going
+                // our playback
+                // However, maybe we would check here if the state is "InitialState", and if it is,
+                // we would break our loop as well.
             },
             // no message
             Err(_) => {}
         }
+        // Update Amcodec's internal pseudo state machine
         match amcodec.update_state() {
             Err(e) => {
                 println!("amcodec_thread: error when updating internal state: {}", e.display());
             },
             Ok(true) => {
+                // if it returns Ok(true), we should replace this by a new Amcodec (to "clear" the
+                // buffer)
+                // I couldn't find any other or better way than to close and reopen the device
+                // again to "flush".
                 drop(amcodec);
                 amcodec = match Amcodec::new(status_sender.clone()) {
                     Ok(amcodec) => amcodec,
@@ -615,6 +672,7 @@ pub fn main_loop(mut amcodec: Amcodec,
             },
             Ok(_) => {},
         }
+        // small sleep time avoids active waiting
         thread::sleep(Duration::from_millis(10));
     }
     if cfg!(debug_assertions) {

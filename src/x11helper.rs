@@ -1,3 +1,8 @@
+/*
+ * Most of these calls are self explanatory or can be explained
+ * easily when looking at the X11 documentation.
+ */
+
 use error::*;
 
 use x11_dl::xlib;
@@ -8,6 +13,8 @@ use std::sync::{Arc, atomic};
 
 struct Display(pub *mut xlib::Display);
 
+// pointers are not Send-able across threads by default, these two lines allow us to unsafely
+// override this fact (which is safe in our case: X11 API is thread safe)
 unsafe impl Send for Display {}
 unsafe impl Sync for Display {}
 
@@ -41,11 +48,11 @@ impl X11Helper {
         let root = unsafe {(xlib.XRootWindow)(display, screen)};
 
         let mut attributes: xlib::XSetWindowAttributes = unsafe { mem::zeroed() };
-        attributes.background_pixel = 0;
-        attributes.event_mask = 0; //xlib::StructureNotifyMask ;
-
+        attributes.background_pixel = 0; // < Set the whole 32 bits to 0,
+        // making it effectively transparent for the framebuffer
+        attributes.event_mask = 0;
         let mut visual_info_template : xlib::XVisualInfo = unsafe { mem::zeroed() };
-        visual_info_template.depth = 32;
+        visual_info_template.depth = 32; // < this is the part which will allow us to set the alpha component of every pixel to 0
         visual_info_template.screen = unsafe {(xlib.XDefaultScreen)(display)};
         let window = unsafe {
             (xlib.XCreateWindow)(display, root,
@@ -115,8 +122,6 @@ impl X11Helper {
         xclient_message_event.window = self.window;
         xclient_message_event.message_type = wm_state;
         xclient_message_event.format = 32;
-        //xclient_message_event.data.l[0] = 1;
-        //xclient_message_event.data.l[1] = fullscreen;
         xclient_message_event.data = xlib::ClientMessageData::new();
         {
             let mut l : &mut [c_long] = xclient_message_event.data.as_longs_mut();
@@ -137,7 +142,9 @@ impl X11Helper {
         Ok(())
     }
 
-
+    // this is the X11 event loop.
+    // We are not doing anything special in there, but we still need to run this (otherwise X11
+    // doesn't do anything)
     pub fn event_loop(&self, keep_running: Arc<atomic::AtomicBool>) {
         // Hook close requests.
         let wm_delete_window_str = CString::new("WM_DELETE_WINDOW").unwrap();

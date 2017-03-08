@@ -1,9 +1,16 @@
+// _sys.rs or -sys.rs files are files which are only meant to be adaptations of C interfaces of C
+// headers.
+// Most of this header is taken from amcodec.h
+
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
 #![allow(dead_code)]
 use libc::{c_int, c_uint, c_ulong, c_ulonglong, c_void};
 
+// const are equivalent to #DEFINE in C: they don't hold a place in memory,
+// they are automatically replaced by the associated value every time this
+// is found somewhere in the code
 pub const FBIOGET_VSCREENINFO : i32 = 0x4600;
 pub const FBIOPUT_VSCREENINFO : i32 = 0x4601;
 pub const AMSTREAM_PORT_INIT: c_uint = 0x111;
@@ -13,6 +20,10 @@ pub const EXTERNAL_PTS : c_ulong = 1;
 pub const AMSTREAM_GET_EX_VB_STATUS : c_uint = 0x900;
 pub const AMSTREAM_GET_EX_VDECSTAT : c_uint = 0x902;
 
+// these are helpers which don't call ioctl by itself, but rather
+// generate functions that call ioctl themselves.
+// For instance this generates a function "amstream_ioc_get_version(fd: c_int, value: *mut value)"
+// where value will have the AMSTREAM version right after this call.
 ioctl!(read amstream_ioc_get_version with b'S', 0xc0; c_int);
 ioctl!(bad fbio_get_vscreen_info with 0x4600);
 ioctl!(bad fbio_set_vscreen_info with 0x4601);

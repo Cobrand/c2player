@@ -1,3 +1,8 @@
+/*
+ * This file is the interface which will be public in the .so library
+ */
+
+
 // nightly is required because of this
 // maybe stable 1.18 will stabilize this ?
 #![feature(untagged_unions)]
@@ -30,10 +35,17 @@ use std::mem;
 use utils::*;
 use error::*;
 
+// When this function is called, a struct named FfiPlayer is crated,
+// initialized and allocated on the Heap. Its initialization takes
+// care of spawning other threads which will communicate between each
+// others. 
+//
+// Box is the equivalent to a unique_ptr in C++, so we must ensure that
+// our FfiPlayer allocated on the heap will not be deallocated here (because
+// we need it in future calls). `into_raw` noth transforms into a pointer and forgets
+// memory-wise the Box, so it isn't deallocated right now
 #[no_mangle]
 pub extern fn aml_video_player_create() -> *mut c_void {
-    // get a sender which will allow the player to
-    // send messages to another thread
     let player : FfiPlayer = match player::player_start() {
         Ok(player) => player,
         Err(e) => {
@@ -49,6 +61,17 @@ pub extern fn aml_video_player_create() -> *mut c_void {
     Box::into_raw(player) as *mut c_void
 }
 
+// For almost every other call, we need to retrieve FfiPlayer from the given pointer. It is of
+// course very risky since the API user can send us a totally unrelated pointer, but we don't
+// really have a choice here ...
+//
+// Since the command (or Message) is sent to another thread, we get an answer right away saying
+// that "the message has been sent", but we would like to know if the command that we just did
+// failed or not (for instance with load, if the file exists, ...)
+//
+// That is why we are sender along with our message a way for someone in another thread to send us
+// a status code. We will block this part of the thread until we get an answer via this "Single Use
+// Channel" from another thread.
 #[no_mangle]
 pub extern fn aml_video_player_load(player: *mut c_void, video_url: *const c_char) -> c_int {
     let ffi_player = unsafe {Box::from_raw(player as *mut FfiPlayer)};
@@ -74,6 +97,10 @@ pub extern fn aml_video_player_seek(player: *mut c_void, pos: c_float) -> c_int 
     rx.recv().unwrap_or(FfiErrorCode::Disconnected) as c_int
 }
 
+// This function is rather special, since we are blocking until an "end of video" message is sent
+// to us. Basically this message (which is at the moment always returned when the VPU hits EOF)
+// allows us to get the exact moment where a video is finished, so that we can queue the next one
+// right up, or shutdown the program right after the video's done.
 #[no_mangle]
 pub extern fn aml_video_player_wait_until_end(player: *mut c_void) -> c_int {
     let mut ffi_player = unsafe {Box::from_raw(player as *mut FfiPlayer)};
@@ -144,6 +171,12 @@ pub extern fn aml_video_player_set_pos(player: *mut c_void, x: c_int, y: c_int) 
     rx.recv().unwrap_or(FfiErrorCode::Disconnected) as c_int
 }
 
+// this is the opposite from "create", we are dereferencing the given pointer,
+// sending a Shutdown message (more on that in player.rs), and then we wait for every thread to
+// finish and return the appropiate status code if some threads failed to finish properly.
+//
+// The FfiPlayer allocated on the Heap is deallocated automatically at the end of this function,
+// because its destructor deallocates the memory in this case.
 #[no_mangle]
 pub extern fn aml_video_player_destroy(player: *mut c_void) -> c_int {
     let ffi_player = unsafe {Box::from_raw(player as *mut FfiPlayer)};

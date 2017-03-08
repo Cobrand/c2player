@@ -12,6 +12,10 @@ use std::thread::JoinHandle;
 use libavformat;
 use super::libavhelper::avformat_version;
 
+/// This is the struct that will get "forgotten" and sent back to the API every time the user needs
+/// do send a command. For all these calls the most important thing here is "sender", but the
+/// others are needed for "destroy" as well: we need to wait for all the threads to finish for us
+/// to finish, so we need to join every thread in "destroy".
 pub struct FfiPlayer {
     pub main_thread: JoinHandle<()>,
     pub x11_event_loop_thread: JoinHandle<()>,
@@ -23,6 +27,7 @@ pub struct FfiPlayer {
 }
 
 impl FfiPlayer {
+    /// Join all 4 threads and return an error if one didn't return successfully
     pub fn join(self) -> FfiResult {
         let mut error_code = Ok(());
         if let Err(_) = self.main_thread.join() {
@@ -43,7 +48,6 @@ impl FfiPlayer {
         };
         error_code
     }
-
 
     pub fn send_message(&self, message: Message) -> bool {
         match self.sender.send(message) {
@@ -70,6 +74,8 @@ impl FfiPlayer {
     }
 }
 
+/// all the messages possible which can be sent to the main_thread
+/// notice that every single one of them has an equivalent in the API
 pub enum Message {
     SetSize(SuSender<FfiErrorCode>, (u16, u16)),
     SetPos(SuSender<FfiErrorCode>,(i16, i16)),
@@ -83,30 +89,55 @@ pub enum Message {
     Shutdown
 }
 
+// when this is called, we are still in the thread of the user of the API
+// we will need to "detach" our core logic
+//
+// this function returns almost instantly a FfiPlayer (or an error), and spawns
+// multiple threads that have one very specific purpose
+//
+// * libav_thread: receive messages from main thread (such as Load("path")) and send appropriate
+// video hevc packets to the amcodec_thread
+// * amcodec_thread: receive messages from libav_thread and main_thread and process them (write
+// libavpacket in VPU, resize the VPU's output area, ...)
+// * x11_thread : handle the event loop
+// * main_thread: receive messages from the API and send messages to other threads accordingly
 pub fn player_start() -> Result<FfiPlayer> {
     let (version_major, version_minor) = avformat_version();
     // we are only checking the major version here, because breaking changes
     // only happen between major versions, hence even though the minor version changes,
     // we are still "safe" from unexpected behavior
     if version_major != libavformat::LIBAVCODEC_VERSION_MAJOR as u16 {
-        println!("Linked avformat version differs from the one the header was built with.\
-                This can lead to unexpected behavior and segfaults at times.\
-                Aborting");
+        println!("Linked avformat version ({}) differs from the one the header was built with ({}). \
+                This can lead to unexpected behavior and segfaults at times. \
+                Aborting", version_major, libavformat::LIBAVCODEC_VERSION_MAJOR);
         bail!(ErrorKind::WrongLibavVersion);
     } else {
         println!("using libavformat version {}.{}", version_major, version_minor);
     };
 
+    // note that x11_thread doesn't receive messages like other threads: this is because the X11
+    // API is thread safe, and thus we can call multiple functions of the same window at once.
+    // channels allow us to have the guarentee that 1 message is processed at a time, but we don't
+    // really care in x11's case.
     let x11_helper = Arc::new(X11Helper::new(ptr::null_mut())?);
     if let Err(e) = x11_helper.set_borderless(true) {
         println!("failed to set x11 window borderless: {}", e.display());
     };
 
+    // channel from the API to the main_thread
     let (sender, receiver) = mpsc::channel::<Message>();
+    // channel from amcodec_thread to the API thread: send when an EOF is reached on the playback
+    // side
     let (video_status_sender, video_status_rx) = mpsc::channel::<VideoEndReason>();
+
+    // shared boolean between every thread: when this becomes false every thread will stop as soon
+    // as possible
     let keep_running = Arc::new(atomic::AtomicBool::new(true));
     
     let x11_thread = {
+        // thread needs to "move" the caught variables in its closure, hence we need to clone these
+        // so the clones can get moved, otherwise we get a compile error saying we already used
+        // x11_helper (moved in this thread)
         let x11_helper = x11_helper.clone();
         let keep_running = keep_running.clone();
         thread::spawn(move || {
@@ -114,8 +145,15 @@ pub fn player_start() -> Result<FfiPlayer> {
         })
     };
 
+    // channel between libav_thread and amcodec_thread, which is meant for libav to send packets to
+    // amcodec
     let (packet_sender, packet_receiver) = mpsc::channel::<LibavPacket>();
+   
+    // channel beetween main_thread and libav_thread, where messages such as Load("url") are sent
     let (libav_sender, libav_receiver) = mpsc::channel::<(LibavMessage, SuSender<FfiErrorCode>)>();
+
+    // channel between main_thread and amcodec_thread, where messages such as "SetSize(x,y,w,h)"
+    // are sent to amcodec_thread
     let (amcodec_sender, amcodec_receiver) = mpsc::channel::<(AmcodecMessage, SuSender<FfiErrorCode>)>();
 
     let libav_thread = {
@@ -130,6 +168,9 @@ pub fn player_start() -> Result<FfiPlayer> {
         // _fb_wrapper is not used but is the thing that allow us to have a transparent framebuffer
         // as long as it lives we can set some alpha of the framebuffer to 0
         let _fb_wrapper = amcodec::FbWrapper::new()?;
+        // we are doing this initialization here instead of in the thread because we can then
+        // return an error directly if something went wrong (if this went wrong there is no point
+        // in doing anything else)
         let amcodec = amcodec::Amcodec::new(video_status_sender.clone())?;
         let version = amcodec.version()?;
         println!("amcodec_thread: AMSTREAM version {}.{}", version.0, version.1);
@@ -142,6 +183,7 @@ pub fn player_start() -> Result<FfiPlayer> {
     };
 
     let main_thread = {
+        // keep track of the current window's dimensions
         let (mut window_x, mut window_y, mut window_w, mut window_h) = (0i16, 0i16, 1920u16, 1080u16);
         let keep_running = keep_running.clone();
         thread::spawn(move || {
@@ -159,7 +201,13 @@ pub fn player_start() -> Result<FfiPlayer> {
                                 tx.send(FfiErrorCode::Disconnected);
                                 break 'mainloop;
                             }
-                        };
+                        } else {
+                            if let Err(_) = amcodec_channel.send((AmcodecMessage::Resize(window_x, window_y, window_w, window_h), tx.clone())) {
+                                println!("main_thread: amcodec_channel disconnected, aborting");
+                                tx.send(FfiErrorCode::Disconnected);
+                                break 'mainloop;
+                            }
+                        }
                         if let Err(e) = x11_helper.set_fullscreen(b) {
                             println!("main_thread: failed to set x11 window fullscreen: {}", e.display());
                         };
@@ -173,6 +221,8 @@ pub fn player_start() -> Result<FfiPlayer> {
                         tx.send(FfiErrorCode::None);
                     },
                     Message::SetPos(tx,(x, y)) => {
+                        // when setting a position we must set the position of the X11 window as
+                        // well as the position of the VPU's output video
                         window_x = x;
                         window_y = y;
                         if let Err(_) = amcodec_channel.send((AmcodecMessage::Resize(window_x, window_y, window_w, window_h), tx.clone())) {
@@ -226,6 +276,7 @@ pub fn player_start() -> Result<FfiPlayer> {
         })
     };
 
+    // once every thread is spawned, return FfiPlayer to the API caller
     Ok(FfiPlayer {
         main_thread: main_thread,
         x11_event_loop_thread: x11_thread,

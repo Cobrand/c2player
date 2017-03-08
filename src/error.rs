@@ -1,8 +1,12 @@
 #[repr(i32)]
 #[derive(Debug, Clone, Copy)]
-/// == 0 => no error
-/// > 0 : API user error
-/// < 0 : this software unexpected error
+/// These are the errors we will return when calling the .so API.
+///
+/// Here is the basic idea for error codes in here:
+///
+/// * ret == 0 : no error
+/// * ret > 0 : API user error
+/// * ret < 0 : unexpected error coming from this software
 pub enum FfiErrorCode {
     InvalidCommand = 1,
     None = 0,
@@ -57,6 +61,11 @@ pub fn ffi_result_to_int(ffi_result: FfiResult) -> ::std::os::raw::c_int {
 }
 
 pub use error_chain::ChainedError;
+
+// error_chain is a very cool rust package (or crate) that allows us to handle errors in a
+// friendly fashion. It allows chaining errors with result.chain_err(|| ErrorKind::XX ), and
+// returning early errors with bail!(ErrorKind::XX ); (which is a rough equivalent of return
+// Err(ErrorKind::XX) with some extra code to be more generic
 error_chain!{
     errors {
         LibavInternal(code: i32,s: &'static str) {
