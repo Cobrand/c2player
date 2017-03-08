@@ -478,6 +478,10 @@ impl Amcodec {
 
     // this s ia key step for the video processing of the VPU, if we don't do this step the VPU
     // only outputs pitch black
+    //
+    // my guess is that 0001 (on 4 bytes) acts as a "delimiter" of some kind for the VPU, but we
+    // receive the length of the frame from libavformat, so we just need to override the length of
+    // the frame by 0001.
     fn process_nal_packets(data: &mut [u8]) -> Result<()> {
         let mut offset : usize = 0;
         while offset < data.len() {

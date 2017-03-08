@@ -1,3 +1,24 @@
+/**
+ * HOW THIS LIB WORKS (SUMMARY) :
+ *
+ * the amcodec device (/dev/amstream_hevc) needs to be fed raw hevc data to work,
+ * and this data can be found an AVPacket's data for the libavformat lib.
+ *
+ * One thread tries to retrieve AVPacket s while the other writes the raw data in the amcodec
+ * device. This part allows us to decode the HEVC stream with the VPU, but we need to "display" the
+ * stream on screen. The display part is actually kind of a hack: a borderless transparent window
+ * is created (transparent on the framebuffer level and not on the window level) and placed at the
+ * position where we wanted the video to be. The VPU's layer will be shown since the X11 window is
+ * transparent, allowing us to properly see the video's playback.
+ *
+ * For now this is kind of a hack because a standalone window is created for this, meaning if can
+ * be manipulated in your window manager for instance. The ideal way would have been to accept a
+ * X11 window id as a paramter of this library, and create the X11 transparent window as a
+ * subwindow. Tests haven't been made, but the problem of the standalone window should disappear if
+ * this is implement (unfortunately this isn't for now)
+ *
+ */
+
 use error::*;
 use super::x11helper::X11Helper;
 use super::libavhelper::{main_thread as libav_main_thread, Message as LibavMessage, PacketWrapper as LibavPacket};
