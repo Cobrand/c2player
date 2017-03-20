@@ -2,6 +2,20 @@
 
 Name is subject to change
 
+## Introduction
+
+This is a library made in Rust which aims to have a public C ABI. Hence while the library is made in Rust, it can be used in C, C++, Python, Java, ... or more precisely any language that supports the C ABI.
+
+This project was made for a school project in an french Engineering School. The aim of this sub-repo was to:
+
+* Have a very simple API in C to allow usage from (almost) any language
+* Play videos only (for now it is only HEVC videos, but AVC support can be added without much hassle), NO support for audio and NO support for subtitles
+* Allow video loading, window resizing, ... on the fly via the C API
+
+Most of how this works is explained in the code itself. `aml_player.h` is what you should include in your C programs if you link `libc2player.so` (from `/target/*/libc2player.so`). The comments are in french but the names of the functions are self explanatory.
+
+**THIS PROJECT IS NOT MAINTAINED ANYMORE**. While I won't maintain this anymore (mostly because I don't have an odroid c2 device with me anymore), I still wrote the code and will answer any question if asked.
+
 ## Build
 
 This will only show how to install everything to be set up on Linux only.
